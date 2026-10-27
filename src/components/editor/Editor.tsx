@@ -14,7 +14,7 @@ import {
   VolumeX,
   X,
 } from "lucide-react";
-import { downloadBlob, exportCut, type ExportQuality } from "@/lib/export-clip";
+import { downloadBlob, estimateExportBytes, exportCut, formatBytes, type Compression, type ExportQuality } from "@/lib/export-clip";
 import { createSampleClip } from "@/lib/sample-clip";
 import { extractThumbs } from "@/lib/thumbs";
 import { FRAME, clamp, clampTrim, formatClock, nearly, type Trim } from "@/lib/time";
@@ -38,6 +38,7 @@ type Prefs = {
   muted: boolean;
   volume: number;
   quality: ExportQuality;
+  compression: Compression;
   snap: boolean;
 };
 
@@ -50,6 +51,7 @@ const DEFAULT_PREFS: Prefs = {
   muted: false,
   volume: 1,
   quality: "fine",
+  compression: "light",
   snap: true,
 };
 
@@ -121,6 +123,7 @@ export function Editor() {
         muted: typeof parsed.muted === "boolean" ? parsed.muted : prev.muted,
         volume: typeof parsed.volume === "number" ? clamp(parsed.volume, 0, 1) : prev.volume,
         quality: parsed.quality === "lean" || parsed.quality === "fine" || parsed.quality === "rich" ? parsed.quality : prev.quality,
+        compression: parsed.compression === "off" || parsed.compression === "light" || parsed.compression === "tight" ? parsed.compression : prev.compression,
         snap: typeof parsed.snap === "boolean" ? parsed.snap : prev.snap,
       }));
     } catch {
@@ -559,12 +562,15 @@ export function Editor() {
         start: trimRef.current.in,
         end: trimRef.current.out,
         quality: prefs.quality,
+        compression: prefs.compression,
+        width: clip.width,
+        height: clip.height,
         video: videoRef.current,
         signal: ctrl.signal,
         onProgress: (progress, label) => setJob({ progress, label }),
       });
       downloadBlob(result.blob, result.filename);
-      setBanner({ tone: "info", text: `Downloaded ${result.filename}` });
+      setBanner({ tone: "info", text: `Downloaded ${result.filename} · ${formatBytes(result.blob.size)}` });
     } catch (error) {
       if (isAbort(error)) setBanner({ tone: "info", text: "Export canceled" });
       else setBanner({ tone: "error", text: error instanceof Error ? error.message : "Export failed" });
@@ -744,7 +750,7 @@ export function Editor() {
           <button type="button" className={iconBtn} onClick={redo} disabled={!canRedo} aria-label="Redo trim">
             <Redo2 className="size-4" />
           </button>
-          <div className="flex h-11 items-center rounded-md border border-line p-0.5">
+          <div className="flex h-11 items-center rounded-md border border-line p-0.5" role="group" aria-label="Picture quality">
             {(["lean", "fine", "rich"] as const).map((level) => (
               <button
                 key={level}
@@ -760,6 +766,31 @@ export function Editor() {
                 {level}
               </button>
             ))}
+          </div>
+          <div className="flex h-11 items-center gap-1">
+            <span className="px-1 text-xs tracking-wide text-faint uppercase">Compress</span>
+            <div className="flex h-11 items-center rounded-md border border-line p-0.5" role="group" aria-label="Compression">
+              {(["off", "light", "tight"] as const).map((level) => {
+                const bytes = estimateExportBytes(prefs.quality, level, span, clip?.width ?? 0, clip?.height ?? 0);
+                const on = prefs.compression === level;
+                return (
+                  <button
+                    key={level}
+                    type="button"
+                    aria-pressed={on}
+                    className={on ? "h-10 rounded-sm bg-raised px-3 text-xs font-medium text-fg" : "h-10 rounded-sm px-3 text-xs text-faint"}
+                    onClick={() => setPrefs((prev) => ({ ...prev, compression: level }))}
+                  >
+                    <span className="capitalize">{level}</span>
+                    {bytes > 0 ? (
+                      <span className={on ? "ml-1.5 font-mono text-accent tabular-nums" : "ml-1.5 font-mono tabular-nums"}>
+                        ~{formatBytes(bytes)}
+                      </span>
+                    ) : null}
+                  </button>
+                );
+              })}
+            </div>
           </div>
         </div>
       </div>
@@ -842,7 +873,7 @@ export function Editor() {
               ))}
             </dl>
             <p className="border-t border-line px-4 py-3 text-xs text-faint">
-              Drag either edge to trim. The frame at that cut pops up above the handle. The bar above the filmstrip jumps there and plays. Drag the kept region to slide the cut. Scroll to zoom.
+              Drag either edge to trim. The frame at that cut pops up above the handle. The bar above the filmstrip jumps there and plays. Compress shows the estimated size of this cut. Drag the kept region to slide the cut. Scroll to zoom.
             </p>
           </div>
         </div>

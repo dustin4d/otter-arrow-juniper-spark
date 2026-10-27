@@ -1,12 +1,63 @@
 import { trimFilename } from "@/lib/time";
 
 export type ExportQuality = "lean" | "fine" | "rich";
+export type Compression = "off" | "light" | "tight";
 
-const VIDEO_QUALITY = {
-  lean: "low",
-  fine: "medium",
-  rich: "high",
-} as const;
+const QUALITY_VIDEO_BPS: Record<ExportQuality, number> = {
+  lean: 2_000_000,
+  fine: 4_500_000,
+  rich: 9_000_000,
+};
+
+const COMPRESSION_FACTOR: Record<Compression, number> = {
+  off: 1,
+  light: 0.45,
+  tight: 0.18,
+};
+
+const ENCODER_LADDER = ["very-low", "low", "medium", "high", "very-high"] as const;
+
+export function encoderQuality(quality: ExportQuality, compression: Compression): (typeof ENCODER_LADDER)[number] {
+  const base = quality === "lean" ? 1 : quality === "rich" ? 3 : 2;
+  const shift = compression === "tight" ? -2 : compression === "light" ? -1 : 0;
+  return ENCODER_LADDER[Math.max(0, Math.min(ENCODER_LADDER.length - 1, base + shift))];
+}
+
+export function exportRates(
+  quality: ExportQuality,
+  compression: Compression,
+  width: number,
+  height: number,
+): { video: number; audio: number } {
+  const w = width >= 16 ? width : 1280;
+  const h = height >= 16 ? height : 720;
+  const scale = Math.min(3, Math.max(0.35, (w * h) / (1280 * 720)));
+  const video = Math.max(120_000, Math.round(QUALITY_VIDEO_BPS[quality] * COMPRESSION_FACTOR[compression] * scale));
+  return { video, audio: 128_000 };
+}
+
+export function estimateExportBytes(
+  quality: ExportQuality,
+  compression: Compression,
+  seconds: number,
+  width: number,
+  height: number,
+): number {
+  if (!(seconds > 0)) return 0;
+  const rates = exportRates(quality, compression, width, height);
+  return Math.round(((rates.video + rates.audio) * seconds) / 8);
+}
+
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 1) return "—";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  const mb = bytes / (1024 * 1024);
+  if (mb < 10) return `${mb.toFixed(1)} MB`;
+  if (mb < 1024) return `${Math.round(mb)} MB`;
+  const gb = mb / 1024;
+  return gb < 10 ? `${gb.toFixed(1)} GB` : `${Math.round(gb)} GB`;
+}
 
 type CaptureVideo = HTMLVideoElement & {
   captureStream?: () => MediaStream;
@@ -19,21 +70,25 @@ export async function exportCut(options: {
   start: number;
   end: number;
   quality: ExportQuality;
+  compression: Compression;
+  width: number;
+  height: number;
   video: HTMLVideoElement | null;
   signal: AbortSignal;
   onProgress: (progress: number, label: string) => void;
 }): Promise<{ blob: Blob; filename: string }> {
-  const { file, start, end, quality, video, signal, onProgress } = options;
+  const { file, start, end, quality, compression, width, height, video, signal, onProgress } = options;
+  const rates = exportRates(quality, compression, width, height);
   if (signal.aborted) throw abortError();
   try {
     onProgress(0, "Encoding cut");
-    const blob = await encodeWithMediabunny(file, start, end, quality, signal, onProgress);
+    const blob = await encodeWithMediabunny(file, start, end, quality, compression, signal, onProgress);
     return { blob, filename: trimFilename(options.filename) };
   } catch (error) {
     if (signal.aborted || isAbort(error)) throw abortError();
     if (!video || !captureOf(video)) throw error instanceof Error ? error : new Error("Export failed");
     onProgress(0, "Recording cut");
-    const blob = await recordSelection(video, start, end, signal, (progress) => onProgress(progress, "Recording cut"));
+    const blob = await recordSelection(video, start, end, rates, signal, (progress) => onProgress(progress, "Recording cut"));
     const type = blob.type || "video/webm";
     const ext = type.includes("mp4") ? "mp4" : "webm";
     const base = trimFilename(options.filename).replace(/\.mp4$/, "");
@@ -46,6 +101,7 @@ async function encodeWithMediabunny(
   start: number,
   end: number,
   quality: ExportQuality,
+  compression: Compression,
   signal: AbortSignal,
   onProgress: (progress: number, label: string) => void,
 ): Promise<Blob> {
@@ -63,7 +119,6 @@ async function encodeWithMediabunny(
   });
 
   try {
-    const level = VIDEO_QUALITY[quality];
     const conversion = await Conversion.init({
       input,
       output,
@@ -72,7 +127,7 @@ async function encodeWithMediabunny(
       showWarnings: false,
       copy: false,
       video: {
-        quality: new Quality(level),
+        quality: new Quality(encoderQuality(quality, compression)),
         hardwareAcceleration: "prefer-hardware",
         keyFrameInterval: 2,
       },
@@ -112,6 +167,7 @@ function recordSelection(
   video: HTMLVideoElement,
   start: number,
   end: number,
+  rates: { video: number; audio: number },
   signal: AbortSignal,
   onProgress: (progress: number) => void,
 ): Promise<Blob> {
@@ -121,7 +177,7 @@ function recordSelection(
   const mime = pickMime();
   const recorder = new MediaRecorder(
     stream,
-    mime ? { mimeType: mime, videoBitsPerSecond: 4_000_000, audioBitsPerSecond: 128_000 } : undefined,
+    mime ? { mimeType: mime, videoBitsPerSecond: rates.video, audioBitsPerSecond: rates.audio } : undefined,
   );
   const chunks: Blob[] = [];
   recorder.ondataavailable = (event) => {
